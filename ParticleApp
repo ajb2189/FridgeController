@@ -1,0 +1,298 @@
+
+// System state defines & pin defines
+#define SYSTEM_IDLE 1 
+#define SYSTEM_OFF 0 
+#define SYSTEM_COOL 2
+#define SYSTEM_HEAT 3
+#define COOLING_PIN D5
+#define HEATING_PIN D4
+
+// Settings Struct (with default values)
+struct structSettings {
+    double firmwareVersion = 0.9;
+    int systemState = SYSTEM_OFF;
+    int simulatorModeActive = 0;
+    double desiredTemp = 0;
+    double upperLimitTemp = 0;
+    double simulatedCurrentTemp = 65;
+};
+structSettings settings;
+
+// Temp sensor stuff 
+#include "DS18B20/Particle-OneWire.h"
+#include "DS18B20/DS18B20.h"
+
+DS18B20 tempSensor2 = DS18B20(D2); //Sets Pin D2 for Ambient Temp Sensor
+DS18B20 tempSensor1 = DS18B20(D1); //Sets Pin D1 for Water Temp Sensor
+
+char szInfo[64];
+float pubTemp;
+
+double celsius;
+double currentLiquidTemp;           // Liquid temperature in F
+double currentAmbientTemp;          // Ambient temperature in F
+
+unsigned long Metric_Publish_Rate = 10000;
+unsigned long MetricnextPublishTime;
+unsigned long DS18B20nextSampleTime;
+unsigned long DS18B20_SAMPLE_INTERVAL = 2000;
+unsigned char dsAttempts = 0;
+
+// Particle Cloud function prototypes
+int setDesiredTempCloud(String arg);
+int setSystemStateCloud(String arg);
+int setSimulatorModeActiveCloud(String arg);
+int setUpperLimitTempCloud(String arg);
+int setSimulatedCurrentTempCloud(String arg);
+
+void setup() 
+{
+    // Set the SSR outputs to be outputs & turn them both off to start
+    pinMode(COOLING_PIN, OUTPUT);
+    digitalWrite(COOLING_PIN, LOW);
+    pinMode(HEATING_PIN, OUTPUT);
+    digitalWrite(COOLING_PIN, LOW);
+    
+    // Check for reset & load the settings from EEPROM
+    pinMode(D7, INPUT_PULLDOWN);
+    
+    if(digitalRead(D7) == HIGH)
+    {
+        Particle.publish("HARD_RESET","D7 HIGH AT STARTUP");
+        eepromSave();
+    }
+    else
+    {
+        // If this is the first time (ever) we've been through this code save the default settings values. Otherwise load settings from EEPROM 
+        if(EEPROM.read(0)==1) {
+            eepromLoad();
+        }
+        // If data has not been saved, "initialize" the EEPROM
+        else {
+            eepromSave();
+        }
+    }
+    
+    Particle.variable("dTemp", settings.desiredTemp);               // Get the desired temp
+    Particle.variable("scTemp", settings.simulatedCurrentTemp);     // Get the simulated current temp 
+    Particle.variable("sState", settings.systemState);              // Get the system state
+    Particle.variable("uLTemp", settings.upperLimitTemp);           // Get the upper limit temp
+    Particle.variable("fVersion", settings.firmwareVersion);        // Get the firmware version
+    Particle.variable("sMActive", settings.simulatorModeActive);    // Get the simulator mode
+    Particle.variable("cATemp", currentAmbientTemp);
+    Particle.variable("cLTemp", currentLiquidTemp);
+    
+    
+    //          Particle Cloud Functions
+    Particle.function("dTemp", setDesiredTempCloud);                // Set Desired Temp
+    Particle.function("scTemp", setSimulatedCurrentTempCloud);      // Set Simulated Current Temp
+    Particle.function("sState", setSystemStateCloud);               // Set System State
+    Particle.function("uLTemp", setUpperLimitTempCloud);            // Set Upper Limit Temp
+    Particle.function("sMActive", setSimulatorModeActiveCloud);     // Set Simulator Mode (0 = off, 1+ = on)
+    
+}
+/* This function loops forever --------------------------------------------*/
+void loop()
+{
+    if (millis() > DS18B20nextSampleTime)
+    {
+        getTemps();
+    }
+    if (millis() > MetricnextPublishTime)
+    {
+        publishData();
+    }
+
+    if (settings.systemState == SYSTEM_OFF)
+    {
+       TOfC();
+    }
+    else
+    {
+        if (settings.systemState == SYSTEM_COOL)
+        {
+            if (currentAmbientTemp > settings.desiredTemp)
+            {
+                TOnC();
+            }
+            else
+            {
+                setSystemState(SYSTEM_IDLE);
+            }
+        }
+        else
+        {
+            if (currentAmbientTemp > (settings.desiredTemp + settings.upperLimitTemp))
+            {
+                setSystemState(SYSTEM_COOL);
+            }
+            else
+            {
+                TOfC();
+            }
+        }
+    }
+}
+
+int setSystemState(int newState)
+{
+    if(newState != settings.systemState)
+    {
+        settings.systemState = newState;
+        eepromSave();
+    }
+    return 1;
+}
+
+//          Publish temp data every few seconds //
+void publishData()
+{
+    if(!tempSensor1.crcCheck())
+    {
+        Particle.publish("liquid temp", "crcFail", PRIVATE);
+    }
+    else
+    {
+        sprintf(szInfo, "%2.2f", currentLiquidTemp);
+        Particle.publish("liquid temp", szInfo, PRIVATE);
+    }
+    if(!tempSensor2.crcCheck())
+    {
+        Particle.publish("ambient temp", "crcFail", PRIVATE);
+    }
+    else
+    {
+        sprintf(szInfo, "%2.2f", currentAmbientTemp);
+        Particle.publish("ambient temp", szInfo, PRIVATE);
+    }
+    MetricnextPublishTime = millis() + Metric_Publish_Rate;
+}
+
+//          Poll temp sensors for latest readings   //
+void getTemps()
+{
+    if (settings.simulatorModeActive != 0)
+    {
+        currentAmbientTemp = settings.simulatedCurrentTemp;
+    }
+    else
+    {
+        if(!tempSensor2.search())
+        {
+            tempSensor2.resetsearch();
+            celsius = tempSensor2.getTemperature();
+            while (!tempSensor2.crcCheck() && dsAttempts < 4)
+            {
+                dsAttempts++;
+                
+                if (dsAttempts == 3)
+                {
+                    delay(1000);
+                }
+                
+                tempSensor2.resetsearch();
+                celsius = tempSensor2.getTemperature();
+            }
+            dsAttempts = 0;
+            currentAmbientTemp = tempSensor2.convertToFahrenheit(celsius);
+            DS18B20nextSampleTime = millis() + DS18B20_SAMPLE_INTERVAL;
+        }
+    }
+    
+    if(!tempSensor1.search())
+    {
+        tempSensor1.resetsearch();
+        celsius = tempSensor1.getTemperature();
+        while (!tempSensor1.crcCheck() && dsAttempts < 4)
+        {
+            dsAttempts++;
+
+            if (dsAttempts == 3)
+            {
+                delay(1000);
+            }
+            
+            tempSensor1.resetsearch();
+            celsius = tempSensor1.getTemperature();
+        }
+        dsAttempts = 0;
+        currentLiquidTemp = tempSensor1.convertToFahrenheit(celsius);
+        DS18B20nextSampleTime = millis() + DS18B20_SAMPLE_INTERVAL;
+    }
+}
+
+
+
+
+
+// Turn on Cooler
+void TOnC()
+{
+    digitalWrite(COOLING_PIN, HIGH);
+}
+
+// Turn off Cooler
+void TOfC()
+{
+    digitalWrite(COOLING_PIN, LOW);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+//          Particle Cloud Function to set desired liquid temp
+int setDesiredTempCloud(String arg)
+{
+    settings.desiredTemp = arg.toInt();
+    eepromSave();
+    return 1;
+}
+
+//          Particle Cloud function to set system state
+int setSystemStateCloud(String arg)
+{
+    return setSystemState(arg.toInt());;
+}
+
+//          Particle Cloud function to set upper limit in F
+int setUpperLimitTempCloud(String arg)
+{
+    settings.upperLimitTemp = arg.toInt();
+    eepromSave();
+    return 1;
+}
+
+int setSimulatorModeActiveCloud(String arg)
+{
+    settings.simulatorModeActive = arg.toInt();
+    eepromSave();
+    return 1;
+}
+
+int setSimulatedCurrentTempCloud(String arg)
+{
+    settings.simulatedCurrentTemp = arg.toInt();
+    return 1;
+}
+
+void eepromSave()
+{
+    Particle.publish("EEPROM", "SAVED");
+    EEPROM.update(0, 1);
+    EEPROM.put(1, settings);
+    eepromLoad();
+}
+
+void eepromLoad()
+{
+    Particle.publish("EEPROM", "LOADED");
+    EEPROM.get(1, settings);
+}
